@@ -20,15 +20,15 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("QuickShot 快截")]
 [assembly: System.Reflection.AssemblyProduct("QuickShot")]
-[assembly: System.Reflection.AssemblyVersion("1.0.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.1.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.0.1")]   // 文件属性里的"产品版本"
+[assembly: System.Reflection.AssemblyVersion("1.0.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.2.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.2")]   // 文件属性里的"产品版本"
 
 namespace QuickShot
 {
     static class AppInfo
     {
-        public const string Version = "1.0.1";
+        public const string Version = "1.0.2";
         // 官方下载地址
         public const string RepoUrl = "https://github.com/sunjerry2-arch/QuickShot";
     }
@@ -147,6 +147,7 @@ namespace QuickShot
         const uint MOD_ALT = 1, MOD_CONTROL = 2, MOD_SHIFT = 4;
         static readonly uint[] HkMods = { MOD_ALT, MOD_CONTROL | MOD_ALT, MOD_CONTROL | MOD_SHIFT };
         static readonly string[] HkNames = { "Alt+A", "Ctrl+Alt+A", "Ctrl+Shift+A" };
+        const int NoHotkey = 3;   // "不使用快捷键"：只从托盘菜单截图，不占任何按键
         const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
         NotifyIcon tray;
@@ -174,6 +175,10 @@ namespace QuickShot
                 hkItems.Add(it);
                 hkMenu.DropDownItems.Add(it);
             }
+            hkMenu.DropDownItems.Add(new ToolStripSeparator());
+            var noneItem = new ToolStripMenuItem("不使用快捷键（从这个菜单截图）", null, delegate { ChangeHotkey(NoHotkey); });
+            hkItems.Add(noneItem);   // 下标正好是 NoHotkey
+            hkMenu.DropDownItems.Add(noneItem);
             menu.Items.Add(hkMenu);
             autoItem = new ToolStripMenuItem("开机自动启动", null, delegate { ToggleAutoStart(); });
             autoItem.Checked = IsAutoStart();
@@ -183,29 +188,36 @@ namespace QuickShot
             menu.Items.Add(new ToolStripMenuItem("退出", null, delegate { ExitApp(); }));
 
             tray = new NotifyIcon();
-            using (var bmp = IconMaker.Draw(SystemInformation.SmallIconSize.Width))
-                tray.Icon = Icon.FromHandle(bmp.GetHicon());
-            tray.ContextMenuStrip = menu;
+            UpdateTrayIcon();
+            tray.ContextMenuStrip = menu;   // 只有右键出菜单；左键单击不做任何事，防止误触截图
             tray.Text = "快截 QuickShot";
             tray.Visible = true;
-            tray.MouseClick += delegate(object s, MouseEventArgs e) { if (e.Button == MouseButtons.Left) StartCapture(); };
+            SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;   // 任务栏深浅色切换时换图标
 
             int pref = Settings.GetInt("Hotkey", 0);
-            if (pref < 0 || pref >= HkNames.Length) pref = 0;
+            if (pref < 0 || pref > NoHotkey) pref = 0;
             int got = -1;
-            if (hk.Register(HkMods[pref], 0x41)) got = pref;
+            if (pref == NoHotkey) got = NoHotkey;
+            else if (hk.Register(HkMods[pref], 0x41)) got = pref;
             else
+                // 想要的键被占了（比如微信先开着）：让给对方，自己换一个空着的
                 for (int i = 0; i < HkNames.Length && got < 0; i++)
                     if (i != pref && hk.Register(HkMods[i], 0x41)) got = i;
             hkIndex = got;
             UpdateHotkeyUi();
 
             if (got < 0)
-                tray.ShowBalloonTip(5000, "快截 QuickShot", "快捷键全被其他程序占用了，可以单击托盘图标截图。", ToolTipIcon.Warning);
+                tray.ShowBalloonTip(8000, "快截：快捷键都被占用了",
+                    "可以右键托盘图标，选「截图」。", ToolTipIcon.Warning);
             else if (got != pref)
-                tray.ShowBalloonTip(6000, "快截 QuickShot", HkNames[pref] + " 已被其他程序占用（多半是微信/QQ），已改用 " + HkNames[got] + "。可在托盘菜单里更换。", ToolTipIcon.Info);
+                tray.ShowBalloonTip(10000, "快截：" + HkNames[pref] + " 已被其他程序占用（可能是微信）",
+                    "已让给对方使用，快截改用 " + HkNames[got] + " 截图。\n" +
+                    "也可以右键托盘图标 → 快捷键，换成别的按键或选「不使用快捷键」。", ToolTipIcon.Info);
             else if (!quiet)
-                tray.ShowBalloonTip(4000, "快截 QuickShot 已在后台运行", "按 " + HkNames[got] + " 截图，截完直接 Ctrl+V 粘贴。本软件免费开源，右键托盘图标可设置。", ToolTipIcon.Info);
+                tray.ShowBalloonTip(4000, "快截 QuickShot 已在后台运行",
+                    got == NoHotkey ? "右键托盘图标，选「截图」。本软件免费开源。"
+                                    : "按 " + HkNames[got] + " 截图，截完直接 Ctrl+V 粘贴。本软件免费开源，右键托盘图标可设置。",
+                    ToolTipIcon.Info);
         }
 
         void ShowAbout()
@@ -226,23 +238,30 @@ namespace QuickShot
         void UpdateHotkeyUi()
         {
             for (int i = 0; i < hkItems.Count; i++) hkItems[i].Checked = i == hkIndex;
-            string name = hkIndex >= 0 ? HkNames[hkIndex] : "无快捷键";
-            captureItem.Text = "截图\t" + name;
-            tray.Text = "快截 QuickShot（" + name + "）";
+            bool hasKey = hkIndex >= 0 && hkIndex < HkNames.Length;
+            captureItem.Text = hasKey ? "截图\t" + HkNames[hkIndex] : "截图";
+            tray.Text = hasKey ? "快截 QuickShot（" + HkNames[hkIndex] + " 截图）" : "快截 QuickShot（右键菜单截图）";
         }
 
         void ChangeHotkey(int idx)
         {
             if (idx == hkIndex) return;
-            if (hk.Register(HkMods[idx], 0x41))
+            if (idx == NoHotkey)
+            {
+                hk.Unregister();
+                hkIndex = NoHotkey;
+                Settings.SetInt("Hotkey", idx);
+            }
+            else if (hk.Register(HkMods[idx], 0x41))
             {
                 hkIndex = idx;
                 Settings.SetInt("Hotkey", idx);
             }
             else
             {
-                if (hkIndex >= 0) hk.Register(HkMods[hkIndex], 0x41);
-                tray.ShowBalloonTip(4000, "快截 QuickShot", HkNames[idx] + " 已被其他程序占用，换一个试试。", ToolTipIcon.Warning);
+                if (hkIndex >= 0 && hkIndex < HkNames.Length) hk.Register(HkMods[hkIndex], 0x41);
+                tray.ShowBalloonTip(5000, "快截：" + HkNames[idx] + " 已被其他程序占用",
+                    "可能是微信等软件在用，换一个按键试试。", ToolTipIcon.Warning);
             }
             UpdateHotkeyUi();
         }
@@ -301,8 +320,25 @@ namespace QuickShot
             catch (Exception ex) { Log.Write("Show failed: " + ex); }
         }
 
+        Icon trayIcon;
+
+        void UpdateTrayIcon()
+        {
+            Icon old = trayIcon;
+            trayIcon = IconMaker.TrayIcon(SystemInformation.SmallIconSize.Width, IconMaker.TaskbarIsLight());
+            tray.Icon = trayIcon;
+            if (old != null) old.Dispose();
+        }
+
+        void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            if (e.Category == UserPreferenceCategory.General || e.Category == UserPreferenceCategory.VisualStyle)
+                UpdateTrayIcon();
+        }
+
         void ExitApp()
         {
+            SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
             if (overlay != null) overlay.Close();
             tray.Visible = false;
             tray.Dispose();
@@ -338,6 +374,61 @@ namespace QuickShot
                 }
             }
             return bmp;
+        }
+
+        // 托盘图标：透明底，只画裁剪符号；按像素对齐填矩形，小尺寸也清晰无毛边
+        public static Bitmap DrawTray(int size, Color ink)
+        {
+            var bmp = new Bitmap(size, size, PixelFormat.Format32bppArgb);
+            using (var g = Graphics.FromImage(bmp))
+            using (var b = new SolidBrush(ink))
+            {
+                g.Clear(Color.Transparent);
+                g.SmoothingMode = SmoothingMode.None;
+                float s = size;
+                int w = Math.Max(2, (int)Math.Round(s * 0.12f));            // 线宽
+                int lo = (int)Math.Round(s * 0.06f), hi = (int)Math.Round(s * 0.94f);
+                int a = (int)Math.Round(s * 0.28f - w / 2f);                  // 靠左/靠上那根
+                int c = (int)Math.Round(s * 0.72f - w / 2f);                  // 靠右/靠下那根
+                // 第一个 L：竖线 x=a，从顶部到 c；横线 y=c，从 a 到右边
+                g.FillRectangle(b, a, lo, w, c + w - lo);
+                g.FillRectangle(b, a, c, hi - a, w);
+                // 第二个 L：横线 y=a，从左边到 c；竖线 x=c，从 a 到底部
+                g.FillRectangle(b, lo, a, c + w - lo, w);
+                g.FillRectangle(b, c, a, w, hi - a);
+            }
+            return bmp;
+        }
+
+        public static Icon TrayIcon(int size, bool lightTaskbar)
+        {
+            Color ink = lightTaskbar ? Color.FromArgb(28, 28, 28) : Color.White;
+            using (var bmp = DrawTray(size, ink))
+            {
+                byte[] dib = Dib(bmp);
+                var ms = new MemoryStream();
+                var bw = new BinaryWriter(ms);
+                bw.Write((short)0); bw.Write((short)1); bw.Write((short)1);
+                bw.Write((byte)size); bw.Write((byte)size); bw.Write((byte)0); bw.Write((byte)0);
+                bw.Write((short)1); bw.Write((short)32); bw.Write(dib.Length); bw.Write(22);
+                bw.Write(dib);
+                bw.Flush();
+                ms.Position = 0;
+                return new Icon(ms, size, size);   // 直接用带 alpha 的 ICO 数据，避免 GetHicon 的黑边
+            }
+        }
+
+        public static bool TaskbarIsLight()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+                {
+                    object v = k == null ? null : k.GetValue("SystemUsesLightTheme");
+                    return v is int && (int)v == 1;
+                }
+            }
+            catch { return false; }
         }
 
         static byte[] Png(Bitmap bmp)
@@ -598,7 +689,7 @@ namespace QuickShot
     class OverlayForm : Form
     {
         enum Phase { Choose, Selected }
-        enum DragMode { None, Creating, Moving, Resizing, Drawing, MovingText }
+        enum DragMode { None, Creating, Moving, Resizing, Drawing, MovingText, ResizingText }
 
         class Btn
         {
@@ -643,6 +734,11 @@ namespace QuickShot
         Font tbFont;
         Shape editOrig;          // 正在重新编辑的那段文字
         int editIdx;
+        Shape selText;           // 当前选中的文字（显示虚线框和四角控制点）
+        int textHandle;          // 正在拖的角：0 左上 1 右上 2 右下 3 左下
+        Font rsStartFont;        // 开始缩放时的字体
+        Rectangle rsStartBounds;
+        Point rsAnchor;          // 缩放时固定不动的对角
         Shape dragShape;         // 正在拖动的文字
         Point dragShapeStart;
 
@@ -810,6 +906,8 @@ namespace QuickShot
                 r.Inflate(Sc(3), Sc(3));
                 using (var p = new Pen(Color.FromArgb(200, 255, 255, 255))) { p.DashStyle = DashStyle.Dash; g.DrawRectangle(p, r); }
             }
+
+            DrawSelText(g);
 
             if (ToolbarVisible()) DrawToolbar(g);
             if (ShowMagnifier()) DrawMagnifier(g);
@@ -1224,6 +1322,7 @@ namespace QuickShot
             Cursor c;
             if (OverBar(p)) c = Cursors.Hand;
             else if (phase == Phase.Choose) c = Cursors.Cross;
+            else if (HitTextHandle(p) >= 0) c = HitTextHandle(p) % 2 == 0 ? Cursors.SizeNWSE : Cursors.SizeNESW;
             else if (CanGrabText() && HitHandle(p) < 0 && TextAt(p) != null) c = Cursors.SizeAll;
             else if (tool == Tool.None)
             {
@@ -1248,6 +1347,7 @@ namespace QuickShot
             foreach (var s in shapes) if (s.Font != null) s.Font.Dispose();
             shapes.Clear();
             cur = null;
+            selText = null;
             sel = Rectangle.Empty;
             phase = Phase.Choose;
             tool = Tool.None;
@@ -1287,18 +1387,35 @@ namespace QuickShot
             moved = false;
             if (phase == Phase.Choose) { drag = DragMode.Creating; return; }
 
-            // 点中已写好的文字：拖动它（文字工具下单击不拖 = 重新编辑）
+            // 点中选中文字的四角：等比缩放
+            int th = HitTextHandle(p);
+            if (th >= 0)
+            {
+                textHandle = th;
+                rsStartFont = selText.Font;
+                rsStartBounds = selText.TextBounds();
+                Rectangle b = rsStartBounds;
+                rsAnchor = th == 0 ? new Point(b.Right, b.Bottom) : th == 1 ? new Point(b.Left, b.Bottom)
+                         : th == 2 ? new Point(b.Left, b.Top) : new Point(b.Right, b.Top);
+                drag = DragMode.ResizingText;
+                return;
+            }
+
+            // 点中已写好的文字：选中并可拖动
             if (CanGrabText() && HitHandle(p) < 0)
             {
                 Shape ts = TextAt(p);
                 if (ts != null)
                 {
+                    selText = ts;
                     dragShape = ts;
                     dragShapeStart = ts.Pts[0];
                     drag = DragMode.MovingText;
+                    Invalidate();
                     return;
                 }
             }
+            selText = null;   // 点在别处：取消文字选中
 
             if (tool == Tool.None)
             {
@@ -1402,6 +1519,22 @@ namespace QuickShot
                     if (moved && dragShape != null)
                         dragShape.Pts[0] = new Point(dragShapeStart.X + p.X - downPt.X, dragShapeStart.Y + p.Y - downPt.Y);
                     break;
+                case DragMode.ResizingText:
+                    if (selText != null && rsStartFont != null)
+                    {
+                        // 按鼠标到固定对角的距离等比缩放，取横竖两个方向里放大更多的那个
+                        float w0 = Math.Max(1, rsStartBounds.Width), h0 = Math.Max(1, rsStartBounds.Height);
+                        float ratio = Math.Max(Math.Abs(p.X - rsAnchor.X) / w0, Math.Abs(p.Y - rsAnchor.Y) / h0);
+                        float px = Math.Max(8f * S, Math.Min(400f * S, rsStartFont.Size * ratio));
+                        Font nf = new Font(rsStartFont.FontFamily, px, rsStartFont.Style, GraphicsUnit.Pixel);
+                        if (selText.Font != rsStartFont) selText.Font.Dispose();
+                        selText.Font = nf;
+                        Size ns = selText.TextBounds().Size;
+                        int nx = (textHandle == 0 || textHandle == 3) ? rsAnchor.X - ns.Width : rsAnchor.X;
+                        int ny = (textHandle == 0 || textHandle == 1) ? rsAnchor.Y - ns.Height : rsAnchor.Y;
+                        selText.Pts[0] = new Point(nx, ny);
+                    }
+                    break;
                 default:
                     if (phase == Phase.Choose) hover = WindowAt(p);
                     UpdateCursor(p);
@@ -1435,12 +1568,14 @@ namespace QuickShot
                     break;
                 case DragMode.MovingText:
                     {
-                        Shape ts = dragShape;
+                        // 单击只选中（显示缩放框），双击才进入编辑
                         dragShape = null;
-                        drag = DragMode.None;
-                        if (!moved && tool == Tool.Text && ts != null) { EditText(ts); return; }
                         break;
                     }
+                case DragMode.ResizingText:
+                    if (selText != null && rsStartFont != null && selText.Font != rsStartFont) rsStartFont.Dispose();
+                    rsStartFont = null;
+                    break;
             }
             drag = DragMode.None;
             LayoutToolbar();
@@ -1468,6 +1603,52 @@ namespace QuickShot
             return phase == Phase.Selected && (tool == Tool.None || tool == Tool.Text);
         }
 
+        // 选中文字的外框（比文字本身稍大一圈）；没有选中时返回空
+        Rectangle SelTextFrame()
+        {
+            if (selText == null || tb != null || !CanGrabText() || !shapes.Contains(selText)) return Rectangle.Empty;
+            Rectangle r = selText.TextBounds();
+            r.Inflate(Sc(4), Sc(4));
+            return r;
+        }
+
+        Point[] SelTextCorners()
+        {
+            Rectangle r = SelTextFrame();
+            return new[] { new Point(r.Left, r.Top), new Point(r.Right, r.Top), new Point(r.Right, r.Bottom), new Point(r.Left, r.Bottom) };
+        }
+
+        int HitTextHandle(Point p)
+        {
+            if (SelTextFrame().IsEmpty) return -1;
+            Point[] cs = SelTextCorners();
+            int tol = Math.Max(5, Sc(6));
+            for (int i = 0; i < 4; i++)
+                if (Math.Abs(p.X - cs[i].X) <= tol && Math.Abs(p.Y - cs[i].Y) <= tol) return i;
+            return -1;
+        }
+
+        void DrawSelText(Graphics g)
+        {
+            Rectangle r = SelTextFrame();
+            if (r.IsEmpty) return;
+            using (var white = new Pen(Color.White))
+            using (var dash = new Pen(Ui.Ink))
+            {
+                dash.DashStyle = DashStyle.Dash;
+                g.DrawRectangle(white, r);
+                g.DrawRectangle(dash, r);
+            }
+            int hs = Math.Max(6, Sc(7));
+            using (var pen = new Pen(Ui.Ink))
+                foreach (Point c in SelTextCorners())
+                {
+                    var hr = new Rectangle(c.X - hs / 2, c.Y - hs / 2, hs, hs);
+                    g.FillRectangle(Brushes.White, hr);
+                    g.DrawRectangle(pen, hr);
+                }
+        }
+
         Shape TextAt(Point p)
         {
             for (int i = shapes.Count - 1; i >= 0; i--)
@@ -1486,6 +1667,7 @@ namespace QuickShot
         {
             editIdx = shapes.IndexOf(s);
             if (editIdx < 0) return;
+            selText = null;
             shapes.RemoveAt(editIdx);
             editOrig = s;
             BeginText(s.Pts[0], s.Font, s.Color, s.Text);
