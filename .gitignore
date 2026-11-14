@@ -1,0 +1,6 @@
+# 编译产物：exe 放到 GitHub Releases 发布，不进代码仓库
+*.exe
+*.pdb
+app.ico
+# 发布用的打包文件夹
+dist/
