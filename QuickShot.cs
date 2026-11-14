@@ -20,14 +20,15 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("QuickShot 快截")]
 [assembly: System.Reflection.AssemblyProduct("QuickShot")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.0.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.1.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.1")]   // 文件属性里的"产品版本"
 
 namespace QuickShot
 {
     static class AppInfo
     {
-        public const string Version = "1.0.0";
+        public const string Version = "1.0.1";
         // 官方下载地址
         public const string RepoUrl = "https://github.com/sunjerry2-arch/QuickShot";
     }
@@ -411,7 +412,7 @@ namespace QuickShot
 
     // ---------------------------------------------------------------- 标注图形
 
-    enum Tool { None, Rect, Ellipse, Arrow, Pen, Mosaic, Text }
+    enum Tool { None, Rect, Ellipse, Line, Arrow, Pen, Mosaic, Text }
 
     class Shape
     {
@@ -425,10 +426,18 @@ namespace QuickShot
         const TextFormatFlags TextFlags = TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix |
             TextFormatFlags.PreserveGraphicsClipping | TextFormatFlags.PreserveGraphicsTranslateTransform;
 
+        // 文字占据的区域，用于点中拖动
+        public Rectangle TextBounds()
+        {
+            Size sz = TextRenderer.MeasureText(Text, Font, new Size(int.MaxValue, int.MaxValue),
+                TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+            return new Rectangle(Pts[0], sz);
+        }
+
         public bool IsValid()
         {
             if (Pts.Count == 0) return false;
-            if (Kind == Tool.Rect || Kind == Tool.Ellipse || Kind == Tool.Arrow)
+            if (Kind == Tool.Rect || Kind == Tool.Ellipse || Kind == Tool.Line || Kind == Tool.Arrow)
             {
                 int dx = Pts[1].X - Pts[0].X, dy = Pts[1].Y - Pts[0].Y;
                 return dx * dx + dy * dy >= 9;
@@ -463,6 +472,13 @@ namespace QuickShot
                         }
                         break;
                     }
+                case Tool.Line:
+                    using (var p = new Pen(Color, Width))
+                    {
+                        p.StartCap = LineCap.Round; p.EndCap = LineCap.Round;
+                        g.DrawLine(p, Pts[0], Pts[1]);
+                    }
+                    break;
                 case Tool.Arrow:
                     DrawArrow(g, Pts[0], Pts[1]);
                     break;
@@ -582,7 +598,7 @@ namespace QuickShot
     class OverlayForm : Form
     {
         enum Phase { Choose, Selected }
-        enum DragMode { None, Creating, Moving, Resizing, Drawing }
+        enum DragMode { None, Creating, Moving, Resizing, Drawing, MovingText }
 
         class Btn
         {
@@ -597,8 +613,8 @@ namespace QuickShot
         static readonly float[] LineWidths = { 2f, 4f, 7f };
         static readonly float[] MosaicWidths = { 12f, 22f, 36f };
         static readonly float[] FontSizes = { 16f, 22f, 32f };
-        static readonly string[] BarIds = { "rect", "ellipse", "arrow", "pen", "mosaic", "text", "|", "undo", "save", "|", "cancel", "done" };
-        static readonly string[] BarTips = { "矩形（按住 Shift 画正方形）", "椭圆（按住 Shift 画正圆）", "箭头", "画笔", "马赛克", "文字", null,
+        static readonly string[] BarIds = { "rect", "ellipse", "line", "arrow", "pen", "mosaic", "text", "|", "undo", "save", "|", "cancel", "done" };
+        static readonly string[] BarTips = { "矩形（按住 Shift 画正方形）", "椭圆（按住 Shift 画正圆）", "直线（按住 Shift 保持水平/垂直/45°）", "箭头（按住 Shift 保持水平/垂直/45°）", "画笔", "马赛克", "文字", null,
             "撤销 Ctrl+Z", "保存到文件 Ctrl+S", null, "退出截图 Esc", "完成，复制到剪贴板（Enter / 双击）" };
 
         // 跨次截图记住颜色和粗细
@@ -625,6 +641,10 @@ namespace QuickShot
         Shape cur;
         TextBox tb;
         Font tbFont;
+        Shape editOrig;          // 正在重新编辑的那段文字
+        int editIdx;
+        Shape dragShape;         // 正在拖动的文字
+        Point dragShapeStart;
 
         List<Btn> btns = new List<Btn>();
         Rectangle barRect = Rectangle.Empty, subRect = Rectangle.Empty;
@@ -953,6 +973,7 @@ namespace QuickShot
             {
                 case "rect": return Tool.Rect;
                 case "ellipse": return Tool.Ellipse;
+                case "line": return Tool.Line;
                 case "arrow": return Tool.Arrow;
                 case "pen": return Tool.Pen;
                 case "mosaic": return Tool.Mosaic;
@@ -1083,6 +1104,9 @@ namespace QuickShot
                     case "ellipse":
                         g.DrawEllipse(p, b.X + 0.08f * s, b.Y + 0.16f * s, 0.84f * s, 0.68f * s);
                         break;
+                    case "line":
+                        g.DrawLine(p, P(b, 0.16f, 0.84f), P(b, 0.84f, 0.16f));
+                        break;
                     case "arrow":
                         g.DrawLine(p, P(b, 0.18f, 0.82f), P(b, 0.8f, 0.2f));
                         g.DrawLines(p, new[] { P(b, 0.42f, 0.18f), P(b, 0.82f, 0.18f), P(b, 0.82f, 0.58f) });
@@ -1200,6 +1224,7 @@ namespace QuickShot
             Cursor c;
             if (OverBar(p)) c = Cursors.Hand;
             else if (phase == Phase.Choose) c = Cursors.Cross;
+            else if (CanGrabText() && HitHandle(p) < 0 && TextAt(p) != null) c = Cursors.SizeAll;
             else if (tool == Tool.None)
             {
                 int h = HitHandle(p);
@@ -1262,6 +1287,19 @@ namespace QuickShot
             moved = false;
             if (phase == Phase.Choose) { drag = DragMode.Creating; return; }
 
+            // 点中已写好的文字：拖动它（文字工具下单击不拖 = 重新编辑）
+            if (CanGrabText() && HitHandle(p) < 0)
+            {
+                Shape ts = TextAt(p);
+                if (ts != null)
+                {
+                    dragShape = ts;
+                    dragShapeStart = ts.Pts[0];
+                    drag = DragMode.MovingText;
+                    return;
+                }
+            }
+
             if (tool == Tool.None)
             {
                 int h = HitHandle(p);
@@ -1288,7 +1326,7 @@ namespace QuickShot
             cur.Color = curColor;
             cur.Width = (tool == Tool.Mosaic ? MosaicWidths[sizeIdx] : LineWidths[sizeIdx]) * S;
             cur.Pts.Add(p);
-            if (tool == Tool.Rect || tool == Tool.Ellipse || tool == Tool.Arrow) cur.Pts.Add(p);
+            if (tool == Tool.Rect || tool == Tool.Ellipse || tool == Tool.Line || tool == Tool.Arrow) cur.Pts.Add(p);
             drag = DragMode.Drawing;
             Invalidate();
         }
@@ -1347,9 +1385,22 @@ namespace QuickShot
                                 int m = Math.Max(Math.Abs(dx), Math.Abs(dy));
                                 q = new Point(p0.X + (dx < 0 ? -m : m), p0.Y + (dy < 0 ? -m : m));
                             }
+                            else if ((ModifierKeys & Keys.Shift) != 0 && (cur.Kind == Tool.Line || cur.Kind == Tool.Arrow))
+                            {
+                                // 按住 Shift：吸附到水平 / 垂直 / 45°
+                                double dx = q.X - p0.X, dy = q.Y - p0.Y;
+                                double len = Math.Sqrt(dx * dx + dy * dy);
+                                double ang = Math.Round(Math.Atan2(dy, dx) / (Math.PI / 4)) * (Math.PI / 4);
+                                q = new Point(p0.X + (int)Math.Round(len * Math.Cos(ang)), p0.Y + (int)Math.Round(len * Math.Sin(ang)));
+                            }
                             cur.Pts[1] = q;
                         }
                     }
+                    break;
+                case DragMode.MovingText:
+                    if (!moved && (Math.Abs(p.X - downPt.X) > 2 || Math.Abs(p.Y - downPt.Y) > 2)) moved = true;
+                    if (moved && dragShape != null)
+                        dragShape.Pts[0] = new Point(dragShapeStart.X + p.X - downPt.X, dragShapeStart.Y + p.Y - downPt.Y);
                     break;
                 default:
                     if (phase == Phase.Choose) hover = WindowAt(p);
@@ -1382,6 +1433,14 @@ namespace QuickShot
                     if (cur != null && cur.IsValid()) shapes.Add(cur);
                     cur = null;
                     break;
+                case DragMode.MovingText:
+                    {
+                        Shape ts = dragShape;
+                        dragShape = null;
+                        drag = DragMode.None;
+                        if (!moved && tool == Tool.Text && ts != null) { EditText(ts); return; }
+                        break;
+                    }
             }
             drag = DragMode.None;
             LayoutToolbar();
@@ -1392,6 +1451,11 @@ namespace QuickShot
         protected override void OnMouseDoubleClick(MouseEventArgs e)
         {
             base.OnMouseDoubleClick(e);
+            if (e.Button == MouseButtons.Left && tb == null && CanGrabText())
+            {
+                Shape ts = TextAt(e.Location);
+                if (ts != null) { EditText(ts); return; }   // 双击文字：重新编辑
+            }
             if (e.Button == MouseButtons.Left && phase == Phase.Selected && tool == Tool.None
                 && sel.Contains(e.Location) && !OverBar(e.Location))
                 Finish();
@@ -1399,16 +1463,66 @@ namespace QuickShot
 
         // ------------------------------------------------ 文字
 
+        bool CanGrabText()
+        {
+            return phase == Phase.Selected && (tool == Tool.None || tool == Tool.Text);
+        }
+
+        Shape TextAt(Point p)
+        {
+            for (int i = shapes.Count - 1; i >= 0; i--)
+            {
+                Shape s = shapes[i];
+                if (s.Kind != Tool.Text) continue;
+                Rectangle r = s.TextBounds();
+                r.Inflate(Sc(3), Sc(3));
+                if (r.Contains(p)) return s;
+            }
+            return null;
+        }
+
+        // 把已写好的文字重新变回输入框；Esc 取消时原样放回，清空内容再确认就是删除
+        void EditText(Shape s)
+        {
+            editIdx = shapes.IndexOf(s);
+            if (editIdx < 0) return;
+            shapes.RemoveAt(editIdx);
+            editOrig = s;
+            BeginText(s.Pts[0], s.Font, s.Color, s.Text);
+            Point off = tb.GetPositionFromCharIndex(0);
+            tb.Location = new Point(s.Pts[0].X - off.X, s.Pts[0].Y - off.Y);
+            tb.SelectionStart = tb.Text.Length;
+            Invalidate();
+        }
+
+        void CancelText()
+        {
+            if (tb == null) return;
+            if (editOrig != null)
+            {
+                shapes.Insert(Math.Min(editIdx, shapes.Count), editOrig);
+                tbFont = null;   // 字体还归原来的文字所有，别释放
+                editOrig = null;
+            }
+            RemoveTb();
+        }
+
         void BeginText(Point p)
         {
-            tbFont = new Font("Microsoft YaHei UI", FontSizes[sizeIdx] * S, GraphicsUnit.Pixel);
+            BeginText(p, null, curColor, null);
+        }
+
+        void BeginText(Point p, Font font, Color color, string text)
+        {
+            tbFont = font ?? new Font("Microsoft YaHei UI", FontSizes[sizeIdx] * S, GraphicsUnit.Pixel);
             tb = new TextBox();
             tb.Multiline = true;
             tb.WordWrap = false;
             tb.BorderStyle = BorderStyle.None;
             tb.Font = tbFont;
-            tb.ForeColor = curColor;
-            tb.BackColor = curColor.GetBrightness() > 0.75f ? Color.FromArgb(70, 70, 70) : Color.White;
+            tb.ForeColor = color;
+            tb.BackColor = color.GetBrightness() > 0.75f ? Color.FromArgb(70, 70, 70) : Color.White;
+            if (text != null) tb.Text = text;
             tb.Location = p;
             ResizeTb();
             tb.TextChanged += delegate { ResizeTb(); Invalidate(); };
@@ -1442,6 +1556,7 @@ namespace QuickShot
                 shapes.Add(s);
                 tbFont = null; // 字体归 shape 所有
             }
+            editOrig = null;   // 编辑已确认（内容清空就等于删掉了这段文字）
             RemoveTb();
         }
 
@@ -1462,7 +1577,7 @@ namespace QuickShot
         {
             if (tb != null)
             {
-                if (keyData == Keys.Escape) { RemoveTb(); return true; }
+                if (keyData == Keys.Escape) { CancelText(); return true; }
                 if (keyData == Keys.Enter) { CommitText(); return true; }   // Shift+Enter 换行
                 return base.ProcessCmdKey(ref msg, keyData);
             }

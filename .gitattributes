@@ -1,0 +1,10 @@
+# 这是 Windows 项目：文本文件检出时统一用 CRLF 换行
+* text=auto eol=crlf
+
+# cmd 脚本必须是 CRLF 才能双击运行：按原样保存，不做任何换行转换
+*.cmd -text
+*.bat -text
+
+*.exe binary
+*.ico binary
+*.png binary
