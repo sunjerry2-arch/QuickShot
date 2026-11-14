@@ -20,15 +20,17 @@ using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("QuickShot 快截")]
 [assembly: System.Reflection.AssemblyProduct("QuickShot")]
-[assembly: System.Reflection.AssemblyVersion("1.0.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.0.2")]   // 文件属性里的"产品版本"
+[assembly: System.Reflection.AssemblyCompany("sunjerry2-arch")]   // Windows 启动列表、文件属性里显示的发布者
+[assembly: System.Reflection.AssemblyCopyright("Copyright (C) 2026 sunjerry2-arch, GPL-3.0")]
+[assembly: System.Reflection.AssemblyVersion("1.0.3.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.0.3.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.0.3")]   // 文件属性里的"产品版本"
 
 namespace QuickShot
 {
     static class AppInfo
     {
-        public const string Version = "1.0.2";
+        public const string Version = "1.0.3";
         // 官方下载地址
         public const string RepoUrl = "https://github.com/sunjerry2-arch/QuickShot";
     }
@@ -119,6 +121,78 @@ namespace QuickShot
         public void Dispose() { Unregister(); DestroyHandle(); }
     }
 
+    // 开机自启。Windows「设置 → 应用 → 启动」和任务管理器里的开关，
+    // 不会删掉 Run 里的登记，而是在 StartupApproved 里另记一笔"已禁用"，这里两边一起认。
+    static class AutoStart
+    {
+        const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        const string ApprovedKey = @"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+        const string Name = "QuickShot";
+
+        static string Command(string exePath) { return "\"" + exePath + "\" /autostart"; }
+
+        public static bool IsEnabled()
+        {
+            try
+            {
+                using (var k = Registry.CurrentUser.OpenSubKey(RunKey))
+                    if (k == null || k.GetValue(Name) == null) return false;
+                using (var k = Registry.CurrentUser.OpenSubKey(ApprovedKey))
+                {
+                    byte[] v = k == null ? null : k.GetValue(Name) as byte[];
+                    return v == null || v.Length == 0 || (v[0] & 1) == 0;   // 首字节为奇数（如 03）= 在 Windows 设置里被关掉了
+                }
+            }
+            catch { return false; }
+        }
+
+        public static void Set(bool on, string exePath)
+        {
+            using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (on) k.SetValue(Name, Command(exePath));
+                else k.DeleteValue(Name, false);
+            }
+            // 清掉 Windows 记的"已禁用"，这样两边状态一致；开启时才能真正生效
+            using (var k = Registry.CurrentUser.OpenSubKey(ApprovedKey, true))
+                if (k != null) k.DeleteValue(Name, false);
+        }
+
+        public static void FixPath(string exePath)
+        {
+            using (var k = Registry.CurrentUser.OpenSubKey(RunKey, true))
+            {
+                if (k == null) return;
+                string cur = k.GetValue(Name) as string;
+                if (cur != null && !string.Equals(cur, Command(exePath), StringComparison.OrdinalIgnoreCase))
+                    k.SetValue(Name, Command(exePath));
+            }
+        }
+    }
+
+    // 卸载：清掉快截写过的所有注册表项和日志，退出后再删掉 exe 本身
+    static class Uninstaller
+    {
+        public static void CleanAll()
+        {
+            AutoStart.Set(false, "");                                          // Run 登记 + Windows 的启动开关记录
+            Registry.CurrentUser.DeleteSubKeyTree(@"Software\QuickShot", false); // 快捷键等设置
+            string log = Path.Combine(Path.GetTempPath(), "QuickShot.log");
+            if (File.Exists(log)) File.Delete(log);
+        }
+
+        // 程序运行时不能删除自己：交给一个隐藏的 cmd，等快截退出两秒后再删
+        public static void DeleteAfterExit(string exePath)
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe",
+                "/c ping 127.0.0.1 -n 3 >nul & del /f /q \"" + exePath + "\"");
+            psi.CreateNoWindow = true;
+            psi.UseShellExecute = false;
+            psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+            System.Diagnostics.Process.Start(psi);
+        }
+    }
+
     static class Settings
     {
         const string Key = @"Software\QuickShot";
@@ -148,7 +222,6 @@ namespace QuickShot
         static readonly uint[] HkMods = { MOD_ALT, MOD_CONTROL | MOD_ALT, MOD_CONTROL | MOD_SHIFT };
         static readonly string[] HkNames = { "Alt+A", "Ctrl+Alt+A", "Ctrl+Shift+A" };
         const int NoHotkey = 3;   // "不使用快捷键"：只从托盘菜单截图，不占任何按键
-        const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
 
         NotifyIcon tray;
         HotkeyWindow hk;
@@ -181,10 +254,15 @@ namespace QuickShot
             hkMenu.DropDownItems.Add(noneItem);
             menu.Items.Add(hkMenu);
             autoItem = new ToolStripMenuItem("开机自动启动", null, delegate { ToggleAutoStart(); });
-            autoItem.Checked = IsAutoStart();
+            autoItem.Checked = AutoStart.IsEnabled();
             menu.Items.Add(autoItem);
+            // 用户可能在 Windows 设置 → 应用 → 启动 里改过开关，每次打开菜单都重新读一次
+            menu.Opening += delegate { autoItem.Checked = AutoStart.IsEnabled(); };
+            // 程序被挪到别的文件夹后，把自启登记的路径改成现在的位置，否则开机会找不到
+            try { AutoStart.FixPath(Application.ExecutablePath); } catch { }
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("关于快截（免费软件）", null, delegate { ShowAbout(); }));
+            menu.Items.Add(new ToolStripMenuItem("卸载...", null, delegate { Uninstall(); }));
             menu.Items.Add(new ToolStripMenuItem("退出", null, delegate { ExitApp(); }));
 
             tray = new NotifyIcon();
@@ -266,25 +344,28 @@ namespace QuickShot
             UpdateHotkeyUi();
         }
 
-        bool IsAutoStart()
+        void Uninstall()
         {
-            try { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue("QuickShot") != null; }
-            catch { return false; }
+            string exe = Application.ExecutablePath;
+            string msg =
+                "卸载快截后：\n\n" +
+                "· 清除快截在这台电脑上的所有设置（快捷键、开机自启）\n" +
+                "· 删除程序文件：\n   " + exe + "\n\n" +
+                "确定要卸载吗？";
+            if (MessageBox.Show(msg, "卸载快截", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return;
+            try { Uninstaller.CleanAll(); }
+            catch (Exception ex) { MessageBox.Show("清除设置时出错：" + ex.Message, "卸载快截"); return; }
+            MessageBox.Show("快截已卸载，感谢使用。", "卸载快截", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Uninstaller.DeleteAfterExit(exe);
+            ExitApp();
         }
 
         void ToggleAutoStart()
         {
-            try
-            {
-                bool on = IsAutoStart();
-                using (var k = Registry.CurrentUser.CreateSubKey(RunKey))
-                {
-                    if (on) k.DeleteValue("QuickShot", false);
-                    else k.SetValue("QuickShot", "\"" + Application.ExecutablePath + "\" /autostart");
-                }
-            }
+            try { AutoStart.Set(!AutoStart.IsEnabled(), Application.ExecutablePath); }
             catch (Exception ex) { MessageBox.Show("设置失败：" + ex.Message, "QuickShot"); }
-            autoItem.Checked = IsAutoStart();
+            autoItem.Checked = AutoStart.IsEnabled();
         }
 
         void StartCaptureDelayed()
